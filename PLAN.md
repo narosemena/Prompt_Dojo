@@ -1,50 +1,158 @@
 # Prompt Dojo — Enterprise Prompt Library
-
-## Goal
-A web application where enterprise users can store, share, search, tag, and track changes to prompts. No LLM execution. Auth via SSO (OIDC/OAuth). Audit log tracks who changed what and when.
+## Complete Implementation Plan
 
 ---
 
-## Tech Stack
-| Layer | Choice |
-|---|---|
-| Framework | Next.js 14 (App Router, TypeScript) |
-| Database | PostgreSQL via Prisma ORM |
-| Auth | NextAuth.js v5 with a generic OIDC provider |
-| Styling | Tailwind CSS + shadcn/ui |
-| Search | Postgres full-text search (no external service needed) |
+## Stack
+
+| Layer | Choice | Reason |
+|---|---|---|
+| Framework | Next.js 14 (App Router, TypeScript) | SSR + Server Actions, no separate API layer needed |
+| ORM | Prisma + PostgreSQL (AWS RDS) | Type-safe queries, migration tooling |
+| Auth | NextAuth.js v5 + Okta OIDC | Native Okta issuer support |
+| Styling | Tailwind CSS + shadcn/ui | Rapid enterprise UI |
+| Search | Postgres `tsvector` + GIN index | No external service needed at this scale |
+| Hosting | AWS ECS/Fargate + ALB + RDS Postgres | Containerized, managed infra |
+| Secrets | AWS Secrets Manager | Injected as env vars into ECS task |
 
 ---
 
-## Data Model (Prisma schema)
+## Data Model (Prisma)
 
-```
-User
-  id, email, name, image, role (VIEWER | EDITOR | ADMIN)
-  createdAt
+```prisma
+enum Role { VIEWER EDITOR ADMIN }
+enum PromptStatus { DRAFT PUBLISHED }
+enum AuditAction { CREATED UPDATED PUBLISHED RESTORED DELETED }
+enum AuditEntity { PROMPT CATEGORY TAG USER COMMENT }
 
-Category
-  id, name, slug, description, createdAt
+model User {
+  id            String   @id @default(cuid())
+  email         String   @unique
+  name          String?
+  image         String?
+  role          Role     @default(VIEWER)
+  createdAt     DateTime @default(now())
 
-Tag
-  id, name, slug
+  prompts       Prompt[]       @relation("PromptOwner")
+  updatedPrompts Prompt[]      @relation("PromptUpdater")
+  versions      PromptVersion[]
+  comments      Comment[]
+  favorites     Favorite[]
+  ratings       PromptRating[]
+  auditLogs     AuditLog[]
+}
 
-Prompt
-  id, title, content (text), description
-  categoryId -> Category
-  tags -> Tag[] (many-to-many via PromptTag)
-  createdById -> User
-  updatedById -> User
-  createdAt, updatedAt
-  isPublic (boolean — visible to all enterprise users)
-  searchVector (tsvector, generated column for FTS)
+model Category {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  createdAt   DateTime @default(now())
+  prompts     Prompt[]
+}
 
-AuditLog
-  id, entityType (PROMPT | CATEGORY | TAG | USER)
-  entityId, action (CREATED | UPDATED | DELETED)
-  userId -> User
-  metadata (JSON — what fields changed, old/new values)
-  createdAt
+model Tag {
+  id        String      @id @default(cuid())
+  name      String      @unique
+  slug      String      @unique
+  createdAt DateTime    @default(now())
+  prompts   PromptTag[]
+}
+
+model Prompt {
+  id           String       @id @default(cuid())
+  title        String
+  description  String?
+  content      String       -- plain text, may contain {{variable}} placeholders
+  variables    Json         -- [{name: string, description: string}] extracted from content
+  status       PromptStatus @default(DRAFT)
+  categoryId   String?
+  category     Category?    @relation(fields: [categoryId], references: [id])
+  createdById  String
+  createdBy    User         @relation("PromptOwner", fields: [createdById], references: [id])
+  updatedById  String?
+  updatedBy    User?        @relation("PromptUpdater", fields: [updatedById], references: [id])
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  copyCount    Int          @default(0)
+
+  tags         PromptTag[]
+  versions     PromptVersion[]
+  comments     Comment[]
+  favorites    Favorite[]
+  ratings      PromptRating[]
+  auditLogs    AuditLog[]
+}
+-- searchVector tsvector generated always as
+--   to_tsvector('english', title || ' ' || coalesce(description,'') || ' ' || content)
+--   stored (added via raw SQL migration)
+-- GIN index on searchVector
+
+model PromptTag {
+  promptId String
+  tagId    String
+  prompt   Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  tag      Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+  @@id([promptId, tagId])
+}
+
+model PromptVersion {
+  id          String   @id @default(cuid())
+  promptId    String
+  prompt      Prompt   @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  title       String
+  description String?
+  content     String   -- full snapshot of content at time of save
+  variables   Json
+  createdById String
+  createdBy   User     @relation(fields: [createdById], references: [id])
+  createdAt   DateTime @default(now())
+  restoredFrom String? -- id of the PromptVersion this was restored from
+}
+
+model AuditLog {
+  id         String      @id @default(cuid())
+  entityType AuditEntity
+  entityId   String
+  promptId   String?
+  prompt     Prompt?     @relation(fields: [promptId], references: [id])
+  action     AuditAction
+  userId     String
+  user       User        @relation(fields: [userId], references: [id])
+  metadata   Json        -- {fields: [{field, old, new}], note: string}
+  createdAt  DateTime    @default(now())
+}
+
+model Comment {
+  id        String    @id @default(cuid())
+  promptId  String
+  prompt    Prompt    @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  userId    String
+  user      User      @relation(fields: [userId], references: [id])
+  content   String
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime? -- soft delete
+}
+
+model Favorite {
+  userId    String
+  promptId  String
+  user      User   @relation(fields: [userId], references: [id])
+  prompt    Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+  @@id([userId, promptId])
+}
+
+model PromptRating {
+  userId    String
+  promptId  String
+  user      User   @relation(fields: [userId], references: [id])
+  prompt    Prompt @relation(fields: [promptId], references: [id], onDelete: Cascade)
+  value     Int    -- 1–5
+  updatedAt DateTime @updatedAt
+  @@id([userId, promptId])
+}
 ```
 
 ---
@@ -52,96 +160,160 @@ AuditLog
 ## Application Routes
 
 ```
-/                         → redirect to /prompts
-/login                    → NextAuth sign-in (SSO redirect)
+/                             → redirect to /prompts
+/login                        → NextAuth sign-in → Okta redirect → callback → session
 
-/prompts                  → browse + search all prompts (paginated, filterable by category/tag)
-/prompts/new              → create a new prompt
-/prompts/[id]             → view prompt detail + audit log timeline
-/prompts/[id]/edit        → edit prompt
+/prompts                      → browse PUBLISHED prompts (search, filter by category/tag/author)
+/prompts/new                  → create prompt [EDITOR+]
+/prompts/[id]                 → view prompt detail, variable fill form, copy, comment, rate
+/prompts/[id]/edit            → edit prompt [owner or ADMIN]
+/prompts/[id]/history         → full version timeline with content, diff view, restore [owner or ADMIN]
 
-/categories               → manage categories (ADMIN / EDITOR)
-/admin                    → user management, role assignment (ADMIN only)
+/my-prompts                   → my drafts + published [EDITOR+]
+/favorites                    → my bookmarked prompts
+
+/categories/[slug]            → prompts filtered by category
+
+/admin                        → admin dashboard [ADMIN]
+/admin/users                  → list users, assign roles
+/admin/categories             → CRUD categories (admin-curated)
 ```
 
 ---
 
-## Key Features
+## Access Control Matrix
 
-### 1. Prompt CRUD
-- Rich text area for prompt content (no markdown renderer needed — prompts are plain text)
-- Title, description, category, tags
-- Public/private toggle (private = only creator can see)
-- Server Actions for create/update/delete
+| Action | VIEWER | EDITOR | ADMIN |
+|---|:---:|:---:|:---:|
+| View published prompts | ✓ | ✓ | ✓ |
+| View own drafts | — | ✓ | ✓ |
+| Create prompt | — | ✓ | ✓ |
+| Edit own prompt | — | ✓ | ✓ |
+| Edit any prompt | — | — | ✓ |
+| Publish own prompt | — | ✓ | ✓ |
+| Restore version | — | owner only | ✓ |
+| Delete prompt | — | owner only | ✓ |
+| Create tags | — | ✓ | ✓ |
+| Manage categories | — | — | ✓ |
+| Manage users/roles | — | — | ✓ |
+| Comment, rate, favorite | ✓ | ✓ | ✓ |
 
-### 2. Search & Filter
-- Postgres `tsvector` full-text search across title + content + description
-- Filter sidebar: category, tags, author, date range
-- URL-driven filters (shareable search URLs)
+---
 
-### 3. SSO Auth (NextAuth OIDC)
-- Single OIDC provider configured via env vars (`OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET`)
-- On first login, user row is auto-created with VIEWER role
-- ADMIN promotes users via `/admin`
+## Key Features — Implementation Notes
 
-### 4. Audit Log
-- Middleware-layer hook: every Server Action that mutates a Prompt writes an AuditLog row
-- Stores: userId, timestamp, action, JSON diff (field → {old, new})
-- Displayed as a timeline on `/prompts/[id]` (who, when, what changed)
+### Auth (Okta OIDC)
+- NextAuth v5 with `OktaProvider(issuer, clientId, clientSecret)`
+- `signIn` callback: upsert User row on first login (name, email, image from ID token claims)
+- `session` callback: attach `user.id` and `user.role` to the session object
+- Middleware: redirect unauthenticated requests from `/prompts*`, `/admin*`, `/favorites*`, `/my-prompts` to `/login`
 
-### 5. Role-Based Access
-| Role | Can do |
+### Prompt Templates (variable detection)
+- Parse `{{variable_name}}` from content using regex `/\{\{([a-zA-Z_][a-zA-Z0-9_]*)\}\}/g`
+- Auto-extract unique variable names on save; merge with existing descriptions
+- Variable editor: list of detected names + freetext description field per variable (no types)
+- Copy-with-fill: prompt opens a modal with one input per variable → substitutes and copies to clipboard
+
+### Draft / Publish Workflow
+- Prompts start as DRAFT (only visible to owner and ADMIN)
+- Owner or ADMIN clicks "Publish" → status → PUBLISHED, audit log entry with action PUBLISHED
+- Published prompts can be un-published back to DRAFT by owner or ADMIN
+
+### Version History + Restore
+- Every `updatePrompt` and `restoreVersion` Server Action writes a `PromptVersion` snapshot in the **same Prisma transaction** as the Prompt update
+- `/prompts/[id]/history` page: timeline of versions, newest first
+  - Each entry: avatar, timestamp, action label, collapsed diff (old content → new content, character-level diff)
+  - "View" button: full-screen side-by-side content viewer
+  - "Restore" button (owner / ADMIN): creates a new version from the snapshot, updates Prompt to that content, writes AuditLog entry with action RESTORED and `metadata.restoredFrom = versionId`
+- Diffs rendered client-side with `diff` npm package
+
+### Search
+- `searchVector` tsvector generated column (raw SQL migration) on Prompt
+- GIN index on `searchVector`
+- Prisma `$queryRaw` for FTS query: `to_tsquery('english', ...)` with prefix matching for live search
+- Filter params encoded in URL query string: `?q=&category=&tag=&author=&status=`
+
+### Social Features
+| Feature | Mechanic |
 |---|---|
-| VIEWER | Read any public prompt |
-| EDITOR | Create, edit own prompts; create categories/tags |
-| ADMIN | Edit/delete any prompt; manage users and roles |
+| **Favorites** | Toggle heart → upsert/delete Favorite row; `/favorites` page lists favorited prompts |
+| **Comments** | Threaded list on prompt detail; soft-delete (show "deleted" placeholder); EDITOR edits own, ADMIN deletes any |
+| **Ratings** | 1–5 star UI; upsert PromptRating; average computed at query time via `_avg` Prisma aggregate |
+| **Copy count** | "Copy" button triggers `incrementCopyCount` Server Action → `UPDATE SET copyCount = copyCount + 1` |
+
+### Audit Log
+- `auditLog(tx, data)` helper accepts a Prisma transaction client; always runs inside the mutating transaction
+- Stored metadata schema: `{ fields: [{field, old, new}], note?: string }`
+- For RESTORED action: `{ restoredFrom: versionId, restoredAt: timestamp }`
+- Displayed on prompt detail in a collapsible "Activity" section at the bottom
 
 ---
 
 ## Implementation Phases
 
-### Phase 1 — Scaffold & Auth
-1. `npx create-next-app@latest` with TypeScript + Tailwind + App Router
-2. Install: `prisma`, `@prisma/client`, `next-auth@beta`, `shadcn/ui`
-3. Write Prisma schema (all models above)
-4. Configure NextAuth with OIDC provider + Prisma adapter
-5. Protect all `/prompts` and `/admin` routes via middleware
+### Phase 1 — Scaffold, Auth, DB (Week 1)
+1. `npx create-next-app@latest` with TS + Tailwind + App Router + ESLint
+2. Install: `prisma @prisma/client next-auth@beta @auth/prisma-adapter`
+3. Install shadcn/ui: `npx shadcn@latest init` + core components (Button, Input, Dialog, Dropdown, Badge, Avatar, Textarea, Tabs, Skeleton)
+4. Write full Prisma schema; `prisma migrate dev --name init`
+5. Raw SQL migration: add `searchVector` generated column + GIN index
+6. NextAuth config: Okta provider, Prisma adapter, `signIn` + `session` callbacks
+7. Route middleware: session check + role guard
+8. Login page: "Sign in with Okta" button, branded layout
 
-### Phase 2 — Prompt Library Core
-6. `/prompts` page: paginated list with search bar + filter sidebar
-7. `/prompts/new` and `/prompts/[id]/edit`: form with category + tag pickers
-8. `/prompts/[id]`: detail view (read-only display of content)
-9. Server Actions: `createPrompt`, `updatePrompt`, `deletePrompt`
-10. FTS: add `searchVector` generated column + GIN index to migration
+### Phase 2 — Prompt CRUD + Templates (Week 2)
+9. Layout: sidebar nav (Browse, My Prompts, Favorites, Admin), top bar with user avatar + logout
+10. `/prompts` list page: paginated cards (title, description snippet, category, tags, star rating, copy count, author avatar), search bar, filter sidebar
+11. `/prompts/new` and `/prompts/[id]/edit`: form with title, description, content textarea, variable detection (live parse on content change), variable description editor, category select, tag multi-input, draft/publish toggle
+12. Server Actions: `createPrompt`, `updatePrompt` (with version snapshot + audit log), `publishPrompt`, `deletePrompt`
+13. `/prompts/[id]` detail view: content display with variable highlighting, copy-with-fill modal, metadata panel, rating stars, favorite toggle, copy count display
 
-### Phase 3 — Audit Log
-11. `auditLog()` helper that writes to AuditLog inside the same Prisma transaction as the mutation
-12. Diff utility: compare old/new prompt fields, serialize changed fields to JSON
-13. Audit timeline component on prompt detail page
+### Phase 3 — Version History + Restore (Week 3)
+14. `/prompts/[id]/history`: sorted version list, diff rendering (character-level, side-by-side)
+15. `restoreVersion` Server Action: snapshot + audit entry with RESTORED action
+16. Inline "Activity" audit log component on prompt detail (collapsed by default)
 
-### Phase 4 — Admin & Polish
-14. `/admin` user table: list users, change role
-15. `/categories` management page
-16. Empty states, loading skeletons, error boundaries
-17. Docker Compose file for local dev (Next.js + Postgres)
-18. `.env.example` documenting all required variables
+### Phase 4 — Social Features (Week 3–4)
+17. Comments: add/edit/delete on prompt detail, optimistic UI
+18. Ratings: star widget with hover state, `upsertRating` Server Action, average on prompt card
+19. Favorites: heart toggle on cards and detail, `/favorites` page
+20. Copy count: increment on copy, displayed on card and detail
+
+### Phase 5 — Admin + AWS Infra (Week 4)
+21. `/admin/users`: paginated user table, role dropdown (ADMIN cannot demote self)
+22. `/admin/categories`: create/rename/delete category, prompt count per category
+23. `/my-prompts`: tabs for DRAFT and PUBLISHED, sorted by updatedAt
+24. Dockerfile: multi-stage (`node:20-alpine` build → `node:20-alpine` runtime)
+25. `docker-compose.yml`: app + Postgres for local dev, with seed script
+26. `ecs-task-definition.json` template: Fargate, Secrets Manager references for DB URL + Okta secrets
+27. GitHub Actions CI: lint → type-check → `prisma migrate deploy` → Docker build + push to ECR
+28. `.env.example`: all required variables documented
 
 ---
 
 ## Environment Variables
-```
-DATABASE_URL=
-NEXTAUTH_SECRET=
-NEXTAUTH_URL=
-OIDC_ISSUER=
-OIDC_CLIENT_ID=
-OIDC_CLIENT_SECRET=
+
+```env
+# Database
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
+
+# NextAuth
+NEXTAUTH_SECRET=          # 32+ char random string
+NEXTAUTH_URL=             # https://your-app-domain.com
+
+# Okta OIDC
+OKTA_ISSUER=              # https://your-org.okta.com
+OKTA_CLIENT_ID=
+OKTA_CLIENT_SECRET=
 ```
 
 ---
 
-## What's NOT included (scope boundary)
-- LLM prompt execution / testing
-- Version history / rollback (audit log only — no restore)
-- Multi-tenant / org isolation (single enterprise deployment)
-- Email notifications
+## Scope Boundary (explicit non-goals for v1)
+
+- No LLM execution / prompt testing inside the app
+- No multi-tenant / org isolation (single enterprise deployment, one Okta tenant)
+- No email notifications
+- No GitHub/GitLab SSO (Okta only)
+- No import/export (CSV, JSON) — may add in v2
+- No team/group scoping of prompts (org-wide visibility model)
